@@ -1,0 +1,271 @@
+#include <QCoreApplication>
+#include <QObject>
+#include <QTimer>
+#include <QDebug>
+#include <QByteArray>
+#include <QtDBus/QDBusConnection>
+#include <QtDBus/QDBusConnectionInterface>
+#include <QtDBus/QDBusContext>
+#include <QtDBus/QDBusError>
+#include <QtDBus/QDBusReply>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <cstring>
+#include <string>
+
+class SailRecorderBridge : public QObject, protected QDBusContext
+{
+    Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "org.sailfishos.SailRecorder")
+
+public:
+    explicit SailRecorderBridge(QObject *parent = nullptr)
+        : QObject(parent)
+    {
+        QTimer *timer = new QTimer(this);
+        timer->setInterval(1500);
+
+        connect(timer, &QTimer::timeout,
+                this, &SailRecorderBridge::refresh);
+
+        timer->start();
+
+        QTimer::singleShot(0, this, &SailRecorderBridge::refresh);
+    }
+
+public slots:
+    void toggle()
+    {
+        if (calledFromDBus()) {
+            const QString sender = message().service();
+
+            uint pid = 0;
+            uint uid = 0;
+            bool pidOk = false;
+            bool uidOk = false;
+
+            QDBusConnectionInterface *iface = connection().interface();
+
+            if (iface) {
+                const QDBusReply<uint> pidReply = iface->servicePid(sender);
+                const QDBusReply<uint> uidReply = iface->serviceUid(sender);
+
+                if (pidReply.isValid()) {
+                    pid = pidReply.value();
+                    pidOk = true;
+                }
+
+                if (uidReply.isValid()) {
+                    uid = uidReply.value();
+                    uidOk = true;
+                }
+            }
+
+            qInfo() << "DBUS AUTH DIAG"
+                    << "sender=" << sender
+                    << "pidOk=" << pidOk
+                    << "pid=" << pid
+                    << "uidOk=" << uidOk
+                    << "uid=" << uid;
+        }
+
+        if (m_busy)
+            return;
+
+        // Her tiklamada daemon'in GERCEK durumunu oku.
+        // Bellekteki state eski kalmis olsa bile Start/Stop dogru secilsin.
+        bool ok = false;
+        const std::string body = socketCommand("status", ok);
+
+        if (ok)
+            m_recording = body.find("Hazir") == std::string::npos;
+
+        command(m_recording ? "stop" : "start");
+    }
+
+    bool status()
+    {
+        bool ok = false;
+        const std::string body = socketCommand("status", ok);
+
+        if (ok)
+            m_recording = body.find("Hazir") == std::string::npos;
+
+        return m_recording;
+    }
+
+    void refresh()
+    {
+        if (m_busy)
+            return;
+
+        bool ok = false;
+        const std::string body = socketCommand("status", ok);
+
+        if (ok)
+            m_recording = body.find("Hazir") == std::string::npos;
+
+        emit stateChanged(m_recording);
+    }
+
+signals:
+    void stateChanged(bool state);
+
+private:
+    bool m_recording = false;
+    bool m_busy = false;
+
+    static std::string socketCommand(const char *path, bool &ok)
+    {
+        ok = false;
+
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0)
+            return {};
+
+        struct timeval timeout;
+        timeout.tv_sec = 3;
+        timeout.tv_usec = 0;
+
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &timeout, sizeof(timeout));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                     &timeout, sizeof(timeout));
+
+        const QByteArray runtimeDir = qgetenv("XDG_RUNTIME_DIR");
+        if (runtimeDir.isEmpty()) {
+            ::close(fd);
+            return {};
+        }
+
+        const QByteArray socketPath =
+            runtimeDir + "/sail-recorder-control.sock";
+
+        sockaddr_un addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+
+        if (socketPath.size() >=
+                static_cast<int>(sizeof(addr.sun_path))) {
+            ::close(fd);
+            return {};
+        }
+
+        std::strncpy(
+            addr.sun_path,
+            socketPath.constData(),
+            sizeof(addr.sun_path) - 1
+        );
+
+        if (::connect(fd,
+                      reinterpret_cast<sockaddr *>(&addr),
+                      sizeof(addr)) != 0) {
+            ::close(fd);
+            return {};
+        }
+
+        std::string request = std::string(path) + "\n";
+
+        const char *ptr = request.data();
+        size_t remaining = request.size();
+
+        while (remaining > 0) {
+            ssize_t n = ::send(fd, ptr, remaining, 0);
+            if (n <= 0) {
+                ::close(fd);
+                return {};
+            }
+
+            ptr += n;
+            remaining -= static_cast<size_t>(n);
+        }
+
+        std::string response;
+        char buffer[4096];
+
+        while (response.size() < 65536) {
+            ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
+
+            if (n == 0)
+                break;
+
+            if (n < 0) {
+                ::close(fd);
+                return {};
+            }
+
+            response.append(buffer, static_cast<size_t>(n));
+        }
+
+        ::close(fd);
+
+        if (response.empty())
+            return {};
+
+        while (!response.empty() &&
+               (response.back() == '\n' ||
+                response.back() == '\r')) {
+            response.pop_back();
+        }
+
+        ok = true;
+        return response;
+    }
+
+    void command(const char *path)
+    {
+        m_busy = true;
+
+        bool ok = false;
+        const std::string reply = socketCommand(path, ok);
+
+        qInfo() << "Sail Recorder" << path
+                << "ok=" << ok
+                << "reply=" << QString::fromStdString(reply);
+
+        m_busy = false;
+
+        // D-Bus method reply once donsun; stateChanged sonraki event-loop
+        // turunda yayinlansin. Top Menu busy durumunda takilmasin.
+        QTimer::singleShot(0, this, &SailRecorderBridge::refresh);
+    }
+};
+
+int main(int argc, char **argv)
+{
+    QCoreApplication app(argc, argv);
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+
+    if (!bus.isConnected()) {
+        qCritical() << "Session D-Bus connection failed";
+        return 2;
+    }
+
+    if (!bus.registerService("org.sailfishos.SailRecorder")) {
+        qCritical() << "Cannot register D-Bus service:"
+                    << bus.lastError().message();
+        return 3;
+    }
+
+    SailRecorderBridge bridge;
+
+    if (!bus.registerObject(
+            "/org/sailfishos/SailRecorder",
+            &bridge,
+            QDBusConnection::ExportAllSlots |
+            QDBusConnection::ExportAllSignals)) {
+        qCritical() << "Cannot register D-Bus object:"
+                    << bus.lastError().message();
+        return 4;
+    }
+
+    return app.exec();
+}
+
+#include "sail-recorder-dbus-bridge.moc"

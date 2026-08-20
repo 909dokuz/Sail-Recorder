@@ -1,0 +1,227 @@
+#include <QCoreApplication>
+#include <QObject>
+#include <QTimer>
+#include <QDebug>
+#include <QtDBus/QDBusConnection>
+#include <QtDBus/QDBusError>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#include <cstring>
+#include <string>
+
+class SailRecorderBridge : public QObject
+{
+    Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "org.sailfishos.SailRecorder")
+
+public:
+    explicit SailRecorderBridge(QObject *parent = nullptr)
+        : QObject(parent)
+    {
+        QTimer *timer = new QTimer(this);
+        timer->setInterval(1500);
+
+        connect(timer, &QTimer::timeout,
+                this, &SailRecorderBridge::refresh);
+
+        timer->start();
+
+        QTimer::singleShot(0, this, &SailRecorderBridge::refresh);
+    }
+
+public slots:
+    void toggle()
+    {
+        if (m_busy)
+            return;
+
+        // Her tiklamada daemon'in GERCEK durumunu oku.
+        // Bellekteki state eski kalmis olsa bile Start/Stop dogru secilsin.
+        bool ok = false;
+        const std::string body = httpGet("status", ok);
+
+        if (ok)
+            m_recording = body.find("Hazir") == std::string::npos;
+
+        command(m_recording ? "stop" : "start");
+    }
+
+    bool status()
+    {
+        bool ok = false;
+        const std::string body = httpGet("status", ok);
+
+        if (ok)
+            m_recording = body.find("Hazir") == std::string::npos;
+
+        return m_recording;
+    }
+
+    void refresh()
+    {
+        if (m_busy)
+            return;
+
+        bool ok = false;
+        const std::string body = httpGet("status", ok);
+
+        if (ok)
+            m_recording = body.find("Hazir") == std::string::npos;
+
+        emit stateChanged(m_recording);
+    }
+
+signals:
+    void stateChanged(bool state);
+
+private:
+    bool m_recording = false;
+    bool m_busy = false;
+
+    static std::string httpGet(const char *path, bool &ok)
+    {
+        ok = false;
+
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+            return {};
+
+        struct timeval timeout;
+        timeout.tv_sec = 3;
+        timeout.tv_usec = 0;
+
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &timeout, sizeof(timeout));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                     &timeout, sizeof(timeout));
+
+        sockaddr_in addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(37822);
+
+        if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+            ::close(fd);
+            return {};
+        }
+
+        if (::connect(fd,
+                      reinterpret_cast<sockaddr *>(&addr),
+                      sizeof(addr)) != 0) {
+            ::close(fd);
+            return {};
+        }
+
+        std::string request =
+            std::string("GET /") + path +
+            " HTTP/1.0\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n\r\n";
+
+        const char *ptr = request.data();
+        size_t remaining = request.size();
+
+        while (remaining > 0) {
+            ssize_t n = ::send(fd, ptr, remaining, 0);
+            if (n <= 0) {
+                ::close(fd);
+                return {};
+            }
+
+            ptr += n;
+            remaining -= static_cast<size_t>(n);
+        }
+
+        std::string response;
+        char buffer[4096];
+
+        while (response.size() < 65536) {
+            ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
+
+            if (n == 0)
+                break;
+
+            if (n < 0) {
+                ::close(fd);
+                return {};
+            }
+
+            response.append(buffer, static_cast<size_t>(n));
+        }
+
+        ::close(fd);
+
+        const std::size_t headerEnd = response.find("\r\n\r\n");
+        if (headerEnd == std::string::npos)
+            return {};
+
+        const std::size_t lineEnd = response.find("\r\n");
+        if (lineEnd == std::string::npos)
+            return {};
+
+        const std::string statusLine = response.substr(0, lineEnd);
+
+        if (statusLine.find(" 200 ") == std::string::npos)
+            return {};
+
+        ok = true;
+        return response.substr(headerEnd + 4);
+    }
+
+    void command(const char *path)
+    {
+        m_busy = true;
+
+        bool ok = false;
+        const std::string reply = httpGet(path, ok);
+
+        qInfo() << "Sail Recorder" << path
+                << "ok=" << ok
+                << "reply=" << QString::fromStdString(reply);
+
+        m_busy = false;
+
+        // D-Bus method reply once donsun; stateChanged sonraki event-loop
+        // turunda yayinlansin. Top Menu busy durumunda takilmasin.
+        QTimer::singleShot(0, this, &SailRecorderBridge::refresh);
+    }
+};
+
+int main(int argc, char **argv)
+{
+    QCoreApplication app(argc, argv);
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+
+    if (!bus.isConnected()) {
+        qCritical() << "Session D-Bus connection failed";
+        return 2;
+    }
+
+    if (!bus.registerService("org.sailfishos.SailRecorder")) {
+        qCritical() << "Cannot register D-Bus service:"
+                    << bus.lastError().message();
+        return 3;
+    }
+
+    SailRecorderBridge bridge;
+
+    if (!bus.registerObject(
+            "/org/sailfishos/SailRecorder",
+            &bridge,
+            QDBusConnection::ExportAllSlots |
+            QDBusConnection::ExportAllSignals)) {
+        qCritical() << "Cannot register D-Bus object:"
+                    << bus.lastError().message();
+        return 4;
+    }
+
+    return app.exec();
+}
+
+#include "sail-recorder-dbus-bridge.moc"
