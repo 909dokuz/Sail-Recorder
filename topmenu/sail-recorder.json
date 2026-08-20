@@ -1,0 +1,14 @@
+{
+    "entries": [
+        {
+            "path": "system_settings/look_and_feel/topmenu/sail-recorder/enable_switch",
+            "type": "custom",
+            "translation_id": "Sail Recorder",
+            "icon": "image://theme/icon-m-video",
+            "params": {
+                "source": "/usr/share/jolla-settings/pages/sail-recorder/EnableSwitch.qml",
+                "type": "grid"
+            }
+        }
+    ]
+}
