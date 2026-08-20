@@ -1,0 +1,11 @@
+[Unit]
+Description=Sail Recorder Top Menu Bridge
+After=sail-recorder-daemon.service
+
+[Service]
+ExecStart=/usr/bin/qmlscene -platform minimal /usr/share/sail-recorder/topmenu/SailRecorderBridge.qml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

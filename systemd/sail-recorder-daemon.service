@@ -1,0 +1,12 @@
+[Unit]
+Description=Sail Recorder Daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/libexec/sail-recorder/sail-recorder-daemon.py
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

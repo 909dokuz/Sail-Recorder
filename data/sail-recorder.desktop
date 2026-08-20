@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sail Recorder
+Comment=Screen recorder for Sailfish OS
+Icon=sail-recorder
+Exec=/usr/bin/qmlscene /usr/share/sail-recorder/qml/SailRecorder.qml
+Terminal=false
+NoDisplay=false
+X-Nemo-Application-Type=silica-qt5
+X-Nemo-Single-Instance=false
